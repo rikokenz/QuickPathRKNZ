@@ -3,7 +3,7 @@
 </p>
 
 <h1 align="center">
-    QuickPathRKNZ
+    QuickPath RKNZ
 </h1>
 
 A lightweight, real-time motion path visualization addon for bones and objects — made because I got frustrated with Blender's native motion path system while animating and just wanted something that worked better for me.
