@@ -75,4 +75,7 @@ The **Calculate All Entries (Global Range)** button in the Global Frame Range bo
 
 *I've only tested this on Blender 5.1, so I honestly can't guarantee it works on other versions. If you run into any errors or bugs, feel free to reach out to me on Discord (rikokenz)*
 
-*Tested & worked on : 4.2*
+## COMPATIBILITY
+*main branch tested on : 5.1, 4.2*
+
+*legacy-extension-support branch tested on : 3.6*
