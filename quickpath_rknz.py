@@ -395,44 +395,98 @@ def cleanup_orphans(scene):
     if props.active_uid not in [n.uid for n in props.nodes]:
         props.active_uid = ''
 
+# ─── Live update: depsgraph dirty-flag + timer debounce ──────────────────────
+#
+# Strategy: on_depsgraph watches for ANY update on objects/armatures/actions
+# that are used by tracked entries (direct + constraint sources). When a match
+# is found it sets _resample_pending = True. A persistent timer then calls
+# do_resample on the next Blender tick, safely outside the depsgraph callback.
+# This is the most reliable approach in Blender 3.6 because:
+#   - keyframe insert fires depsgraph with ACTION or OBJECT id_type (varies)
+#   - moving a key fires OBJECT/ARMATURE (pose re-evaluated)
+#   - msgbus does NOT reliably fire for keyframe_points edits in 3.6
+
+_resample_pending = False
+
+def _get_tracked_ids(scene):
+    """Return a set of (python_type_name, datablock_name) for all objects/actions
+    relevant to tracked entries. Keys match type(u.id).__name__ from depsgraph."""
+    ids = set()
+    props = scene.bmpl_props
+    for node in props.nodes:
+        if node.item_type != 'ENTRY' or not node.enabled: continue
+        actions = _collect_actions_for_node(node)
+        for action in actions:
+            ids.add(('Action', action.name))
+        if node.track_type == 'BONE':
+            obj = bpy.data.objects.get(node.armature_name)
+            if obj: ids.add(('Object', obj.name))
+        else:
+            obj = bpy.data.objects.get(node.object_name)
+            if obj: ids.add(('Object', obj.name))
+    return ids
+
+def _resample_timer():
+    """Timer callback: do the actual resample when pending, then unregister."""
+    global _resample_pending
+    if not _resample_pending:
+        return None
+    _resample_pending = False
+    for scene in bpy.data.scenes:
+        try:
+            if not scene.bmpl_props.live_update: continue
+        except AttributeError:
+            continue
+        cleanup_orphans(scene)
+        do_resample(scene)
+    return None
+
+def refresh_subscriptions():
+    """No-op kept for API compatibility — tracking is now depsgraph-based."""
+    pass
+
 @bpy.app.handlers.persistent
 def on_depsgraph(scene, depsgraph):
-    for u in depsgraph.updates:
-        if u.id and u.id.id_type in ('OBJECT','ARMATURE'):
-            cleanup_orphans(scene); break
+    global _resample_pending
+
     try:
-        if not scene.bmpl_props.live_update: return
-    except AttributeError: return
-    for u in depsgraph.updates:
-        if u.id and u.id.id_type == 'ACTION':
-            do_resample(scene); return
+        live = scene.bmpl_props.live_update
+    except AttributeError:
+        live = False
+
+    # DEBUG: print all updates so we can see what fires in Blender 3.6
+    if live:
+        print("[QuickPath] depsgraph fired")
+        for u in depsgraph.updates:
+            if u.id:
+                print(f"  type={type(u.id).__name__!r}  name={u.id.name!r}")
+
+    if not live: return
+    if _resample_pending: return
+
+    _resample_pending = True
+    bpy.app.timers.register(_resample_timer, first_interval=0.0)
 
 @bpy.app.handlers.persistent
 def on_load(filepath):
-    global _draw_handler
+    global _draw_handler, _resample_pending
     _path_cache.clear()
+    _resample_pending = False
     if _draw_handler:
-        try: bpy.types.SpaceView3D.draw_handler_remove(_draw_handler,'WINDOW')
+        try: bpy.types.SpaceView3D.draw_handler_remove(_draw_handler, 'WINDOW')
         except: pass
         _draw_handler = None
-    _draw_handler = bpy.types.SpaceView3D.draw_handler_add(draw_paths,(),'WINDOW','POST_VIEW')
+    _draw_handler = bpy.types.SpaceView3D.draw_handler_add(draw_paths, (), 'WINDOW', 'POST_VIEW')
     if on_depsgraph not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(on_depsgraph)
     for sc in bpy.data.scenes:
-        if hasattr(sc,'bmpl_props'):
+        if hasattr(sc, 'bmpl_props'):
             sc.bmpl_props.frame_start = sc.frame_start
             sc.bmpl_props.frame_end   = sc.frame_end
 
 def on_live_toggle(self, context):
     if self.live_update:
-        if on_depsgraph not in bpy.app.handlers.depsgraph_update_post:
-            bpy.app.handlers.depsgraph_update_post.append(on_depsgraph)
         do_resample(context.scene)
-    else:
-        any_live = any(sc.bmpl_props.live_update for sc in bpy.data.scenes
-                       if hasattr(sc,'bmpl_props') and sc != context.scene)
-        if not any_live and on_depsgraph in bpy.app.handlers.depsgraph_update_post:
-            bpy.app.handlers.depsgraph_update_post.remove(on_depsgraph)
 
 def on_filter_update(self, context):
     """Live filter — redraw panel on every keystroke."""
@@ -442,19 +496,20 @@ def on_filter_update(self, context):
 def register_handlers():
     global _draw_handler
     if _draw_handler is None:
-        _draw_handler = bpy.types.SpaceView3D.draw_handler_add(draw_paths,(),'WINDOW','POST_VIEW')
+        _draw_handler = bpy.types.SpaceView3D.draw_handler_add(draw_paths, (), 'WINDOW', 'POST_VIEW')
     if on_depsgraph not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(on_depsgraph)
     if on_load not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(on_load)
 
 def unregister_handlers():
-    global _draw_handler
+    global _draw_handler, _resample_pending
+    _resample_pending = False
     if _draw_handler:
-        bpy.types.SpaceView3D.draw_handler_remove(_draw_handler,'WINDOW')
+        bpy.types.SpaceView3D.draw_handler_remove(_draw_handler, 'WINDOW')
         _draw_handler = None
-    for h,lst in [(on_depsgraph,bpy.app.handlers.depsgraph_update_post),
-                  (on_load,     bpy.app.handlers.load_post)]:
+    for h, lst in [(on_depsgraph, bpy.app.handlers.depsgraph_update_post),
+                   (on_load,      bpy.app.handlers.load_post)]:
         if h in lst: lst.remove(h)
 
 # ─── Property Groups ──────────────────────────────────────────────────────────
