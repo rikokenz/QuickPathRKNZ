@@ -157,9 +157,12 @@ def arm_world_mat_at(arm, frame):
     # Apply the armature's own object-level constraints (e.g. COPY_TRANSFORMS,
     # CHILD_OF) so that bone world positions are correct when the armature
     # itself is driven by an object constraint.
+    # Freeze unconstrained_wm so multiple CHILD_OF constraints each see the
+    # same input space their inverse_matrix was baked against.
+    unconstrained_wm = base_wm.copy()
     for c in arm.constraints:
         if not c.mute and c.type in FAST_C_OBJ:
-            base_wm = apply_c(c, base_wm, frame, obj=arm)
+            base_wm = apply_c(c, base_wm, frame, obj=arm, base_wm=unconstrained_wm)
     return base_wm
 
 def bone_world_pos_fc(arm, bone_name, frame):
@@ -239,10 +242,14 @@ def get_constraint_influence(obj_or_arm, bone_name, constraint, frame):
     return constraint.influence
 
 
-def apply_c(c, bm, frame, pose_mat=None, arm=None, bone_name="", arm_world_mat=None, obj=None):
+def apply_c(c, bm, frame, pose_mat=None, arm=None, bone_name="", arm_world_mat=None, obj=None, base_wm=None):
     # obj = plain object (for object constraints with animated influence)
     # arm = armature object (for bone constraints with animated influence)
     # Falls back to static c.influence when neither is supplied.
+    # base_wm = unconstrained world matrix (arm_wm @ pose_mat) kept stable across
+    #           the constraint loop; CHILD_OF always applies against this so that
+    #           each constraint's baked inverse_matrix sees the same input space it
+    #           was computed against, even when multiple CHILD_OF constraints stack.
     if obj is not None:
         inf = get_constraint_influence(obj, "", c, frame)
     elif arm is not None:
@@ -265,17 +272,42 @@ def apply_c(c, bm, frame, pose_mat=None, arm=None, bone_name="", arm_world_mat=N
         tgt = tgt_world_mat(c, frame)
         if tgt is None: return bm
         io = c.inverse_matrix if hasattr(c, 'inverse_matrix') else Matrix.Identity(4)
-        # bm is already the bone's world matrix (arm_world @ armature_space_mat).
-        # CHILD_OF formula: constrained_world = tgt @ inverse_matrix @ arm_world_inv @ bm
-        # i.e. convert bm back to armature space, then parent under tgt.
+        # CHILD_OF formula: constrained_world = tgt @ inverse_matrix @ arm_world_inv @ base_wm
+        # Use base_wm (unconstrained pose world matrix) rather than bm (which may
+        # already be shifted by a prior constraint).  Blender's own evaluator applies
+        # each CHILD_OF against the original rest-pose world matrix, not the
+        # accumulated output of earlier constraints.  Stacked CHILD_OF constraints
+        # are blended independently and summed via lerp, not chained.
+        input_wm = base_wm if base_wm is not None else bm
         if arm_world_mat is not None:
-            constrained = tgt @ io @ arm_world_mat.inverted() @ bm
+            constrained = tgt @ io @ arm_world_mat.inverted() @ input_wm
         else:
             # Fallback: use pose_mat (armature-space bone matrix) if arm_world_mat unavailable
-            pm = pose_mat if pose_mat is not None else bm
+            pm = pose_mat if pose_mat is not None else input_wm
             constrained = tgt @ io @ pm
         return bm.lerp(constrained, inf)
     return bm
+
+_VERTEX_PARENT_TYPES = {'VERTEX', 'VERTEX_3'}
+
+def has_vertex_parenting(obj):
+    """Return True if obj or any ancestor in its parent chain uses vertex parenting.
+
+    Vertex parenting (parent_type VERTEX / VERTEX_3) is resolved by Blender's
+    depsgraph — the offset follows a mesh vertex position that cannot be
+    reconstructed from F-curves alone.  Any object in the parent chain that
+    uses vertex parenting therefore requires the frame_set slow path.
+
+    Also checks bone constraints' targets and the armature's own parent chain
+    when obj is an armature, so that an armature vertex-parented to a mesh is
+    caught correctly.
+    """
+    cur = obj
+    while cur is not None:
+        if cur.parent_type in _VERTEX_PARENT_TYPES:
+            return True
+        cur = cur.parent
+    return False
 
 def all_fast(arm, bn):
     pb = arm.pose.bones.get(bn)
@@ -290,9 +322,16 @@ def bone_pos_constrained(arm, bn, frame):
     if result is None: return None
     m, bone_local_mat = result
     arm_wm = arm_world_mat_at(arm, frame)
-    wm = arm_wm @ m
+    # base_wm is the unconstrained world matrix — kept stable so that each
+    # CHILD_OF constraint's inverse_matrix (which was baked against the
+    # unconstrained pose) is always applied to the correct input space.
+    base_wm = arm_wm @ m
+    wm = base_wm.copy()
     for c in pb.constraints:
-        if not c.mute: wm = apply_c(c, wm, frame, pose_mat=bone_local_mat, arm=arm, bone_name=bn, arm_world_mat=arm_wm)
+        if not c.mute:
+            wm = apply_c(c, wm, frame, pose_mat=bone_local_mat, arm=arm,
+                         bone_name=bn, arm_world_mat=arm_wm,
+                         base_wm=base_wm)
     return wm.translation.copy()
 
 def obj_all_fast(obj):
@@ -309,10 +348,11 @@ def obj_pos_constrained(obj, frame):
     """
     if not obj_all_fast(obj):
         return None
-    wm = obj_world_mat(obj, frame)
+    base_wm = obj_world_mat(obj, frame)
+    wm = base_wm.copy()
     for c in obj.constraints:
         if not c.mute:
-            wm = apply_c(c, wm, frame, obj=obj)
+            wm = apply_c(c, wm, frame, obj=obj, base_wm=base_wm)
     return wm.translation.copy()
 
 def arm_has_transform_keys(arm):
@@ -420,6 +460,17 @@ def entry_uses_slow_path(node):
         if arm is None: return False
         bn  = node.bone_name
         pb  = arm.pose.bones.get(bn)
+        # Vertex parenting anywhere in the armature's parent chain (or on a
+        # bone constraint's target chain) is resolved by Blender's depsgraph
+        # and cannot be replicated from F-curves — force frame_set.
+        if has_vertex_parenting(arm):
+            return True
+        # Also check constraint targets' parent chains for vertex parenting.
+        if pb:
+            for c in pb.constraints:
+                if not c.mute and getattr(c, 'target', None) is not None:
+                    if has_vertex_parenting(c.target):
+                        return True
         has_c = pb and len(pb.constraints) > 0
         c_ok  = all_fast(arm, bn)
         arm_has_action     = arm.animation_data is not None and arm.animation_data.action is not None
@@ -432,6 +483,15 @@ def entry_uses_slow_path(node):
     else:
         obj = bpy.data.objects.get(node.object_name)
         if obj is None: return False
+        # Vertex parenting anywhere in the object's parent chain requires the
+        # depsgraph — cannot be reproduced by the fast path.
+        if has_vertex_parenting(obj):
+            return True
+        # Also check constraint targets' parent chains.
+        for c in obj.constraints:
+            if not c.mute and getattr(c, 'target', None) is not None:
+                if has_vertex_parenting(c.target):
+                    return True
         has_action = obj.animation_data is not None and obj.animation_data.action is not None
         has_c      = len(obj.constraints) > 0
         c_ok       = obj_all_fast(obj)
@@ -457,7 +517,17 @@ def sample_entry(scene, node):
         # Also gate on the armature's own object constraints; arm_world_mat_at
         # applies FAST_C_OBJ ones, but unsupported ones require frame_set.
         arm_obj_c_ok = obj_all_fast(arm)
-        use_fast = arm_has_action and arm_transform_safe and targets_safe and (not has_c or c_ok) and arm_obj_c_ok
+        # Vertex parenting anywhere in the armature's parent chain, or on a
+        # bone constraint's target, requires the depsgraph — force frame_set.
+        vertex_parent_free = not has_vertex_parenting(arm)
+        if vertex_parent_free and pb:
+            for c in pb.constraints:
+                if not c.mute and getattr(c, 'target', None) is not None:
+                    if has_vertex_parenting(c.target):
+                        vertex_parent_free = False
+                        break
+        use_fast = (vertex_parent_free and arm_has_action and arm_transform_safe
+                    and targets_safe and (not has_c or c_ok) and arm_obj_c_ok)
         if use_fast:
             for f in range(fs, fe+1, fst):
                 pos = bone_pos_constrained(arm,bn,f) if has_c else bone_world_pos_fc(arm,bn,f)
@@ -479,7 +549,16 @@ def sample_entry(scene, node):
         # are in the supported set.  Fall back to frame_set otherwise so that
         # unsupported constraints (FOLLOW_PATH, ARMATURE, etc.) are evaluated
         # correctly by Blender's full depsgraph.
-        use_fast = has_action and (not has_c or c_ok)
+        # Vertex parenting anywhere in the object's parent chain, or on a
+        # constraint's target chain, requires the depsgraph — force frame_set.
+        vertex_parent_free = not has_vertex_parenting(obj)
+        if vertex_parent_free:
+            for c in obj.constraints:
+                if not c.mute and getattr(c, 'target', None) is not None:
+                    if has_vertex_parenting(c.target):
+                        vertex_parent_free = False
+                        break
+        use_fast = vertex_parent_free and has_action and (not has_c or c_ok)
         if use_fast:
             for f in range(fs, fe+1, fst):
                 if has_c:
