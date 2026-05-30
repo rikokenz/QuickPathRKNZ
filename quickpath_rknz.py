@@ -394,6 +394,11 @@ def collect_missing_keys(nodes):
         if node.item_type != 'ENTRY':
             continue
 
+        # When Slow Path is explicitly forced the user has opted into depsgraph
+        # frame_set — no keyframes are "missing" for this pipeline stage.
+        if node.force_slow_path:
+            continue
+
         if node.track_type == 'BONE':
             arm = bpy.data.objects.get(node.armature_name)
             if arm is None: continue
@@ -526,8 +531,8 @@ def sample_entry(scene, node):
                     if has_vertex_parenting(c.target):
                         vertex_parent_free = False
                         break
-        use_fast = (vertex_parent_free and arm_has_action and arm_transform_safe
-                    and targets_safe and (not has_c or c_ok) and arm_obj_c_ok)
+        use_fast = (not node.force_slow_path and vertex_parent_free and arm_has_action
+                    and arm_transform_safe and targets_safe and (not has_c or c_ok) and arm_obj_c_ok)
         if use_fast:
             for f in range(fs, fe+1, fst):
                 pos = bone_pos_constrained(arm,bn,f) if has_c else bone_world_pos_fc(arm,bn,f)
@@ -558,7 +563,7 @@ def sample_entry(scene, node):
                     if has_vertex_parenting(c.target):
                         vertex_parent_free = False
                         break
-        use_fast = vertex_parent_free and has_action and (not has_c or c_ok)
+        use_fast = not node.force_slow_path and vertex_parent_free and has_action and (not has_c or c_ok)
         if use_fast:
             for f in range(fs, fe+1, fst):
                 if has_c:
@@ -1913,6 +1918,24 @@ def on_depsgraph(scene, depsgraph):
 
 
 
+@bpy.app.handlers.persistent
+def on_frame_change(scene, depsgraph):
+    """Tag all 3D viewports for redraw on every frame change.
+
+    The POST_VIEW draw handler only fires when a viewport redraws.  During
+    timeline scrubbing or playback Blender advances scene.frame_current but
+    may not redraw the 3D view (e.g. when no animated objects are visible).
+    Without this handler the before/after color split on lines and dots stays
+    frozen at the last fully-redrawn frame until a major viewport event occurs.
+    """
+    for wm in bpy.data.window_managers:
+        for win in wm.windows:
+            if win.screen:
+                for area in win.screen.areas:
+                    if area.type == 'VIEW_3D':
+                        area.tag_redraw()
+
+
 # ─── Handler Registration ─────────────────────────────────────────────────────
 
 def register_handlers():
@@ -1930,6 +1953,8 @@ def register_handlers():
             draw_frame_numbers_2d, (), 'WINDOW', 'POST_PIXEL')
     if on_depsgraph not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(on_depsgraph)
+    if on_frame_change not in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.append(on_frame_change)
 
 
 def unregister_handlers():
@@ -1943,6 +1968,8 @@ def unregister_handlers():
         _text_handler = None
     if on_depsgraph in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(on_depsgraph)
+    if on_frame_change in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.remove(on_frame_change)
     _constraint_state_fingerprint = {}
     _live_matrix_overrides        = {}
     _live_bone_overrides          = {}
@@ -2046,6 +2073,10 @@ class QPRK_Node(bpy.types.PropertyGroup):
         subtype='COLOR_GAMMA', size=4, min=0, max=1, default=(1.0,1.0,1.0,1.0))
     dot_color_after:   bpy.props.FloatVectorProperty(
         subtype='COLOR_GAMMA', size=4, min=0, max=1, default=(1.0,1.0,1.0,1.0))
+    # Slow-path override: when True, always use frame_set even if the fast path
+    # would normally be eligible.  Set manually via "Calculate using Slow Path",
+    # or automatically by the addon when unsupported relations are detected.
+    force_slow_path:   bpy.props.BoolProperty(default=False)
 
 
 class QPRK_SceneProps(bpy.types.PropertyGroup):
@@ -2418,7 +2449,8 @@ class QPRK_OT_ClearEntry(bpy.types.Operator):
     uid: bpy.props.StringProperty()
     def execute(self, context):
         node = get_node(context.scene.bmpl_props, self.uid)
-        if node: _path_cache.pop(node.uid, None)
+        if node:
+            _path_cache.pop(node.uid, None)
         for area in context.screen.areas:
             if area.type == 'VIEW_3D': area.tag_redraw()
         return {'FINISHED'}
@@ -2784,6 +2816,48 @@ transform keyframes. Click to see which objects are missing keyframes."""
         return {'FINISHED'}
 
 
+class QPRK_OT_CalculateSlowPath(bpy.types.Operator):
+    """Calculate using Slow Path (depsgraph frame_set)
+WARNING: Forces frame_set calculation regardless of fast-path eligibility.
+Controls all pipeline stages: cache creation, segment building, dot generation,
+color splitting, and line batching — identical to the 'Calculate Anyway' path
+used when unsupported items are detected.
+Click again to toggle off and recalculate using the normal path."""
+    bl_idname  = "qprk.calculate_slow_path"
+    bl_label   = "Calculate using Slow Path"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    uid: bpy.props.StringProperty()
+
+    def execute(self, context):
+        props = context.scene.bmpl_props
+        node  = get_node(props, self.uid)
+        if node is None or node.item_type != 'ENTRY':
+            return {'CANCELLED'}
+
+        # Toggle the flag first so sample_entry (called inside _invoke_warning_or_calc
+        # → _run_pending_calc → sample_entry) sees the new value and uses/skips
+        # frame_set for EVERY pipeline stage:
+        #   • cache creation  — _path_cache[uid] built via frame_set loop
+        #   • segment building — positions list fed to line()
+        #   • dot generation  — same positions list fed to dots()
+        #   • color splitting  — split index computed from the same cached frames
+        #   • line batching   — batch_for_shader receives the correct vertex list
+        node.force_slow_path = not node.force_slow_path
+
+        # Route through the shared warning-gate exactly like "Calculate Anyway"
+        # does when the user clicks through the unsupported-items dialog.
+        # _invoke_warning_or_calc calls collect_missing_keys; when force_slow_path
+        # is ON there are no "missing keys" to warn about (we're using depsgraph),
+        # so it falls straight through to _run_pending_calc → sample_entry.
+        # When toggling OFF it re-evaluates eligibility normally.
+        result = _invoke_warning_or_calc(context, [node])
+
+        state = "ON" if node.force_slow_path else "OFF"
+        self.report({'INFO'}, f"Slow path {state} for '{node.label or node.bone_name}'")
+        return result
+
+
 class QPRK_OT_ToggleDotColorMode(bpy.types.Operator):
     """Toggle dot color mode between Solid and Split"""
     bl_idname = "qprk.toggle_dot_color_mode"; bl_label = "Toggle Dot Color Mode"
@@ -2854,7 +2928,7 @@ class QPRK_PT_Panel(bpy.types.Panel):
                                  emboss=True, depress=col_enabled)
             opv.uid = node.uid
         else:
-            slow = entry_uses_slow_path(node)
+            slow = node.force_slow_path or entry_uses_slow_path(node)
             # Split the row: left side = checkbox + name, right side = color + buttons.
             # Using a top-level split means the right block is always the same absolute
             # width regardless of how long the name is, so color slot & buttons never shift.
@@ -3091,6 +3165,17 @@ class QPRK_PT_Panel(bpy.types.Panel):
             op2=row.operator("qprk.clear_entry",icon='X',text="Clear This")
             op2.uid=active.uid
 
+            # ── Slow Path button ──────────────────────────────────────────────
+            slow_row = params_box.row(align=True)
+            slow_row.alert = True
+            op_slow = slow_row.operator(
+                "qprk.calculate_slow_path",
+                text="Slow Path (On)" if active.force_slow_path else "Slow Path",
+                icon='LOCKED' if active.force_slow_path else 'ERROR',
+                depress=active.force_slow_path,
+            )
+            op_slow.uid = active.uid
+
             params_box.separator(factor=0.3)
 
             row=params_box.row(align=True)
@@ -3228,6 +3313,7 @@ classes = (
     QPRK_OT_SyncFrameRange,
     QPRK_OT_ApplyToChecked,
     QPRK_OT_SlowPathInfo,
+    QPRK_OT_CalculateSlowPath,
     QPRK_OT_ToggleDotColorMode,
     QPRK_PT_Panel,
 )

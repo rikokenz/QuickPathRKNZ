@@ -1,12 +1,12 @@
 schema_version = "1.0.0"
 
 id = "quickpath_rknz"
-version = "2.1.0"
+version = "2.2.0"
 name = "QuickPath RKNZ"
 tagline = "Quick motion path visualization for bones and objects"
-maintainer = "Rikokenz <https://rikokensfw.carrd.co>"
+maintainer = "Rikokenz <https://github.com/rikokenz>"
 type = "add-on"
-website = "https://rikokensfw.carrd.co"
+website = "https://github.com/rikokenz/QuickPathRKNZ"
 
 tags = ["Animation"]
 
